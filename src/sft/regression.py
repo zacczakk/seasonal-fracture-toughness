@@ -1,4 +1,5 @@
-import logging
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Dict
 
 import numpy as np
@@ -7,10 +8,13 @@ from scipy.odr import ODR, Model, Output, RealData
 from scipy.stats import distributions
 from uncertainties import unumpy as unp
 
-logger = logging.getLogger(__name__)
-# Avoid "No handler found" warnings if the app doesn't configure logging
-if not logger.handlers:
-    logger.addHandler(logging.NullHandler())
+from .utils import (
+    clip_with_penalty,
+    safe_divide,
+    safe_log,
+    safe_power,
+    safe_residual_term,
+)
 
 
 def _arr_stats(name: str, arr: np.ndarray) -> str:
@@ -42,89 +46,53 @@ def residual(beta: list, x: tuple, series_idx: int) -> np.ndarray:
     series_idx : int
         Index of the series the datapoint belongs to.
     """
+    # Unpack data point vectors
+    Gi, Gii = x
 
-    def softplus(z):
-        """Smoothly map to (0, inf)."""
-        return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
+    # Compute per-series bounds based on data ranges
+    series_idx_array = np.asarray(series_idx)
+    bounds = {}
 
-    def smooth_violation(x, lo, hi, k=1e2):
-        """≈ 0 inside [lo, hi]; grows smoothly outside; scales with k."""
-        return softplus(k * (lo - x)) + softplus(k * (x - hi))
+    for series in range(3):
+        mask = series_idx_array == series
+        if np.any(mask):
+            gi_max = float(np.max(Gi[mask]))
+            gii_max = float(np.max(Gii[mask]))
+            bounds[f"GIc_{series + 1}"] = (0, gi_max)
+            bounds[f"GIIc_{series + 1}"] = (0, gii_max)
+        else:
+            # Fallback if series has no data
+            bounds[f"GIc_{series + 1}"] = (0, float(np.max(Gi)))
+            bounds[f"GIIc_{series + 1}"] = (0, float(np.max(Gii)))
 
-    # Unpack multidimensional inputs
-    GIc_1, GIIc_1, GIc_2, GIIc_2, GIc_3, GIIc_3, n, m = beta
-    Gi, Gii = x  # vector with all datapoints for all series
+    # Exponent bounds based on overall data range
+    bounds["n"] = (1e-6, 1)
+    bounds["m"] = (1e-6, 1)
+
+    # Unpack constrained inputs
+    constrained_beta, penalties = clip_with_penalty(beta, bounds)
+    GIc1, GIIc1, GIc2, GIIc2, GIc3, GIIc3, n, m = constrained_beta
 
     # Choose which GIc and GIIc to use based on series index
-    GIc = np.choose(series_idx, [GIc_1, GIc_2, GIc_3])
-    GIIc = np.choose(series_idx, [GIIc_1, GIIc_2, GIIc_3])
+    GIc = np.choose(series_idx, [GIc1, GIc2, GIc3])
+    GIIc = np.choose(series_idx, [GIIc1, GIIc2, GIIc3])
 
-    # Parameter bounds
-    eps = 1e-6
-    Gc_max = 3
+    # Safely compute residual terms
+    mode_I_term = safe_residual_term(Gi, GIc, n)
+    mode_II_term = safe_residual_term(Gii, GIIc, m)
 
-    # Penalty for violations of bounds
-    penalty = 1e3 * (
-        smooth_violation(GIc, 0, 3, k=1e2)  # Don't force, only nudge
-        + smooth_violation(GIIc, 0, 3, k=1e2)  # Don't force, only nudge
-        # + smooth_violation(n, 0, 1.1, k=1e3)
-        # + smooth_violation(m, 0, 1.1, k=1e3)
-    )
+    # Compute residuals (Gi/GIc)^(1/n) + (Gii/GIIc)^(1/m) - 1
+    residuals = mode_I_term + mode_II_term - 1.0
 
-    # Prevent NaNs by strictly enforcing bounds before power-law
-    # operations and penalize violations later
-    GIc = np.clip(GIc, eps, Gc_max)
-    GIIc = np.clip(GIIc, eps, Gc_max)
-    n = np.clip(n, eps, 1)
-    m = np.clip(m, eps, 1)
+    # Add penalty
+    total_penalty = float(np.sum(penalties))
+    if total_penalty > 0:
+        # Scale penalties relative to residual magnitude to reduce intercept bias
+        scale = np.maximum(1.0, np.mean(np.abs(residuals)) + 1e-12)
+        residuals += total_penalty / scale
 
-    # Data points may become negative because of uncertainties
-    Gi = np.where(np.isfinite(Gi), Gi, eps)
-    Gii = np.where(np.isfinite(Gii), Gii, eps)
-    Gi = np.maximum(Gi, eps)
-    Gii = np.maximum(Gii, eps)
-
-    mode_I_residuals = np.maximum(Gi / GIc, 1e-6)
-    mode_II_residuals = np.maximum(Gii / GIIc, 1e-6)
-
-    if not (
-        np.isfinite(mode_I_residuals).all() and np.isfinite(mode_II_residuals).all()
-    ):
-        logger.debug(
-            "non-finite base detected | %s | %s | n=%s m=%s | %s | %s",
-            _arr_stats("base1", mode_I_residuals),
-            _arr_stats("base2", mode_II_residuals),
-            n,
-            m,
-            _arr_stats("GIc", GIc),
-            _arr_stats("GIIc", GIIc),
-        )
-
-    with np.errstate(all="ignore"):
-        residuals = mode_I_residuals ** (1.0 / n) + mode_II_residuals ** (1.0 / m) - 1.0
-        # residuals = (Gi / GIc) ** (1.0 / n) + (Gii / GIIc) ** (1.0 / m) - 1.0
-
-    residuals += penalty
-
-    # Log if nans or infs in residuals
-    if np.any(np.isnan(residuals)) or np.any(np.isinf(residuals)):
-        logger.debug(
-            "non-finite residuals | beta=%s | nans=%d infs=%d",
-            beta,
-            int(np.sum(np.isnan(residuals))),
-            int(np.sum(np.isinf(residuals))),
-        )
-
-    # Smoothly penalize NaNs and Infs
-    # penalty = 1e3 * np.tanh(np.abs(residuals))
-    # residuals = np.where(~np.isfinite(residuals), penalty, residuals)
+    # Catch all remaining NaNs and Infs
     residuals = np.where(~np.isfinite(residuals), 1e6, residuals)
-
-    # Optional: debug when penalties are applied substantially
-    # if logger.isEnabledFor(logging.DEBUG):
-    #     pen_sum = float(np.nansum(penalty))
-    #     if pen_sum > 0:
-    #         logger.debug("penalty_sum=%s", pen_sum)
 
     return residuals
 
@@ -149,38 +117,57 @@ def param_jacobian(beta: list, x: tuple, series_idx: list[int], *args):
     np.ndarray
         Jacobian matrix.
     """
+    # Unpack data point vectors
+    Gi, Gii = x
+    Gi = np.maximum(Gi, 0.0)
+    Gii = np.maximum(Gii, 0.0)
 
-    # Unpack multidimensional inputs
-    GIc_1, GIIc_1, GIc_2, GIIc_2, GIc_3, GIIc_3, n, m = beta
-    Gi, Gii = x  # vector with all datapoints for all series
+    # Compute per-series bounds based on data ranges
+    series_idx_array = np.asarray(series_idx)
+    bounds = {}
+
+    for series in range(3):
+        mask = series_idx_array == series
+        if np.any(mask):
+            gi_max = float(np.max(Gi[mask]))
+            gii_max = float(np.max(Gii[mask]))
+            bounds[f"GIc_{series + 1}"] = (0, gi_max)
+            bounds[f"GIIc_{series + 1}"] = (0, gii_max)
+        else:
+            # Fallback if series has no data
+            bounds[f"GIc_{series + 1}"] = (0, float(np.max(Gi)))
+            bounds[f"GIIc_{series + 1}"] = (0, float(np.max(Gii)))
+
+    # Exponent bounds based on overall data range
+    bounds["n"] = (1e-6, 1)
+    bounds["m"] = (1e-6, 1)
+
+    # Unpack constrained inputs
+    constrained_beta, _ = clip_with_penalty(beta, bounds)
+    GIc1, GIIc1, GIc2, GIIc2, GIc3, GIIc3, n, m = constrained_beta
 
     # Choose which GIc and GIIc to use based on series index
-    GIc = np.choose(series_idx, [GIc_1, GIc_2, GIc_3])
-    GIIc = np.choose(series_idx, [GIIc_1, GIIc_2, GIIc_3])
+    GIc = np.choose(series_idx, [GIc1, GIc2, GIc3])
+    GIIc = np.choose(series_idx, [GIIc1, GIIc2, GIIc3])
 
-    # Parameter bounds
-    eps = 1e-6
-    Gc_max = 3
-
-    # Prevent NaNs by strictly enforcing bounds before power-law
-    # operations and penalize violations later
-    GIc = np.clip(GIc, eps, Gc_max)
-    GIIc = np.clip(GIIc, eps, Gc_max)
-    n = np.clip(n, eps, 1)
-    m = np.clip(m, eps, 1)
-
-    # Data points may become negative because of uncertainties
-    Gi = np.where(np.isfinite(Gi), Gi, eps)
-    Gii = np.where(np.isfinite(Gii), Gii, eps)
-    Gi = np.maximum(Gi, eps)
-    Gii = np.maximum(Gii, eps)
+    # Safely compute jacobian terms
+    mode_I_term = safe_residual_term(Gi, GIc, n)
+    mode_II_term = safe_residual_term(Gii, GIIc, m)
+    mode_I_exp = safe_divide(1.0, n)
+    mode_II_exp = safe_divide(1.0, m)
+    mode_I_log = safe_log(safe_divide(Gi, GIc))
+    mode_II_log = safe_log(safe_divide(Gii, GIIc))
 
     # Calculate derivatives (each np.array of length of x)
     with np.errstate(invalid="ignore"):
-        dGIc = -(((Gi / GIc) ** (1 / n) * (1 / n)) / GIc)
-        dGIIc = -(((Gii / GIIc) ** (1 / m) * (1 / m)) / GIIc)
-        dn = (Gi / GIc) ** (1 / n) * np.log(Gi / GIc) * (-1 / n**2)
-        dm = (Gii / GIIc) ** (1 / m) * np.log(Gii / GIIc) * (-1 / m**2)
+        # dGIc = -(((Gi / GIc) ** (1 / n) * (1 / n)) / GIc)
+        dGIc = -safe_divide(mode_I_term * mode_I_exp, GIc)
+        # dGIIc = -(((Gii / GIIc) ** (1 / m) * (1 / m)) / GIIc)
+        dGIIc = -safe_divide(mode_II_term * mode_II_exp, GIIc)
+        # dn = (Gi / GIc) ** (1 / n) * np.log(Gi / GIc) * (-1 / n**2)
+        dn = mode_I_term * mode_I_log * safe_divide(-1.0, safe_power(n, 2.0))
+        # dm = (Gii / GIIc) ** (1 / m) * np.log(Gii / GIIc) * (-1 / m**2)
+        dm = mode_II_term * mode_II_log * safe_divide(-1, safe_power(m, 2.0))
 
     # Gradient is 0 for all series except the one being fit
     dGIc1 = np.where(series_idx == 0, dGIc, 0)
@@ -191,7 +178,7 @@ def param_jacobian(beta: list, x: tuple, series_idx: list[int], *args):
     dGIIc3 = np.where(series_idx == 2, dGIIc, 0)
 
     # Stack derivaties (number of rowns corresponds to of length of beta)
-    return np.row_stack([dGIc1, dGIIc1, dGIc2, dGIIc2, dGIc3, dGIIc3, dn, dm])
+    return np.vstack([dGIc1, dGIIc1, dGIc2, dGIIc2, dGIc3, dGIIc3, dn, dm])
 
 
 def value_jacobian(beta: list, x: tuple, series_idx: list[int], *args):
@@ -219,36 +206,47 @@ def value_jacobian(beta: list, x: tuple, series_idx: list[int], *args):
     NotImplementedError
         If residual variant is not implemented.
     """
-    # Unpack multidimensional inputs
-    GIc_1, GIIc_1, GIc_2, GIIc_2, GIc_3, GIIc_3, n, m = beta
-    Gi, Gii = x  # vector with all datapoints for all series
+    # Unpack data point vectors
+    Gi, Gii = x
+    Gi = np.maximum(Gi, 0.0)
+    Gii = np.maximum(Gii, 0.0)
+
+    # Compute per-series bounds based on data ranges
+    series_idx_array = np.asarray(series_idx)
+    bounds = {}
+
+    for series in range(3):
+        mask = series_idx_array == series
+        if np.any(mask):
+            gi_max = float(np.max(Gi[mask]))
+            gii_max = float(np.max(Gii[mask]))
+            bounds[f"GIc_{series + 1}"] = (0, gi_max)
+            bounds[f"GIIc_{series + 1}"] = (0, gii_max)
+        else:
+            # Fallback if series has no data
+            bounds[f"GIc_{series + 1}"] = (0, float(np.max(Gi)))
+            bounds[f"GIIc_{series + 1}"] = (0, float(np.max(Gii)))
+
+    # Exponent bounds based on overall data range
+    bounds["n"] = (1e-6, 1)
+    bounds["m"] = (1e-6, 1)
+
+    # Unpack constrained inputs
+    constrained_beta, _ = clip_with_penalty(beta, bounds)
+    GIc1, GIIc1, GIc2, GIIc2, GIc3, GIIc3, n, m = constrained_beta
 
     # Choose which GIc and GIIc to use based on series index
-    GIc = np.choose(series_idx, [GIc_1, GIc_2, GIc_3])
-    GIIc = np.choose(series_idx, [GIIc_1, GIIc_2, GIIc_3])
-
-    # Parameter bounds
-    eps = 1e-6
-    Gc_max = 3
-
-    # Prevent NaNs by strictly enforcing bounds before power-law
-    # operations and penalize violations later
-    GIc = np.clip(GIc, eps, Gc_max)
-    GIIc = np.clip(GIIc, eps, Gc_max)
-    n = np.clip(n, eps, 1)
-    m = np.clip(m, eps, 1)
-
-    # Data points may become negative because of uncertainties
-    Gi = np.where(np.isfinite(Gi), Gi, eps)
-    Gii = np.where(np.isfinite(Gii), Gii, eps)
-    Gi = np.maximum(Gi, eps)
-    Gii = np.maximum(Gii, eps)
+    GIc = np.choose(series_idx, [GIc1, GIc2, GIc3])
+    GIIc = np.choose(series_idx, [GIIc1, GIIc2, GIIc3])
 
     # Calculate derivatives (each np.array of length of x)
-    dGi = ((Gi / GIc) ** (1 / n) * (1 / n)) / Gi
-    dGii = ((Gii / GIIc) ** (1 / m) * (1 / m)) / Gii
+    # dGi = ((Gi / GIc) ** (1 / n) * (1 / n)) / Gi
+    dGi = safe_divide(safe_residual_term(Gi, GIc, n) * safe_divide(1.0, n), Gi)
+    # dGii = ((Gii / GIIc) ** (1 / m) * (1 / m)) / Gii
+    dGii = safe_divide(safe_residual_term(Gii, GIIc, m) * safe_divide(1.0, m), Gii)
+
     # Stack derivaties
-    return np.row_stack([dGi, dGii])
+    return np.vstack([dGi, dGii])
 
 
 def assemble_data(
@@ -278,43 +276,24 @@ def assemble_data(
         Indices of the measurement series.
     """
     # Get the dataframe for the given source
-    try:
-        source_df = df.xs(source, level="source")
-    except KeyError as exc:
-        raise ValueError(
-            f"Source '{source}' not found in DataFrame MultiIndex level 'source'."
-        ) from exc
+    source_df = df.xs(source, level="source")
 
-    # Get the names and indices of all measurement series
-    series_names = sorted(
-        source_df.index.get_level_values("series").unique()
-    )  # '1', '2', '3'
-    series_to_idx = {s: i for i, s in enumerate(series_names)}  # 0, 1, 2
+    # Convert series names to series indices ('1', '2', '3') -> (0, 1, 2)
+    series_names = sorted(source_df.index.get_level_values("series").unique())  # str
+    series2idx = {s: i for i, s in enumerate(series_names)}  # int
 
     # Get data to fit from dataframe
-    Gi = unp.nominal_values(source_df["GIc"].to_numpy())  # Gi from 'GIc'
-    Gii = unp.nominal_values(source_df["GIIc"].to_numpy())  # Gii from 'GIIc'
+    Gi = unp.nominal_values(source_df["GIc"].to_numpy())  # Gi from 'GIc' column
+    Gii = unp.nominal_values(source_df["GIIc"].to_numpy())  # Gii from 'GIIc' column
     Gi_err = unp.std_devs(source_df["GIc"].to_numpy())
     Gii_err = unp.std_devs(source_df["GIIc"].to_numpy())
 
-    if logger.isEnabledFor(logging.INFO):
-        logger.info(
-            "assemble_data | source=%s | %s | %s | %s | %s",
-            source,
-            _arr_stats("Gi", Gi),
-            _arr_stats("Gii", Gii),
-            _arr_stats("Gi_err", Gi_err),
-            _arr_stats("Gii_err", Gii_err),
-        )
-
     # Map series names to indices
-    series_idx = (
-        source_df.index.get_level_values("series").map(series_to_idx).to_numpy()
-    )
+    series_idx = source_df.index.get_level_values("series").map(series2idx).to_numpy()
 
     # Stack data and uncertainties as input array
-    x = np.row_stack([Gi, Gii])
-    sx = np.row_stack([Gi_err, Gii_err])
+    x = np.vstack([Gi, Gii])
+    sx = np.vstack([Gi_err, Gii_err])
 
     # Pack data in scipy ODR format. Scalar input for y implies
     # that the model to be used on the data is implicit
@@ -334,7 +313,7 @@ def run_regression(
     ndigit=12,
     ifixb=[1, 1, 1, 1, 1, 1, 0, 0],
     fit_type=1,
-    deriv=3,  # should not use jacobians when fitting 3 series simultaneously
+    deriv=3,
     init=0,
     iteration=0,
     final=0,
@@ -407,31 +386,8 @@ def run_regression(
         final=final,  # No, short, or long final report
     )
 
-    # Logging
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "run_regression | beta0=%s | sstol=%s partol=%s maxit=%s ndigit=%s ifixb=%s fit_type=%s deriv=%s",
-            beta0,
-            sstol,
-            partol,
-            maxit,
-            ndigit,
-            ifixb,
-            fit_type,
-            deriv,
-        )
-
     # Run optimization
-    out = odr.run()
-    if logger.isEnabledFor(logging.INFO):
-        logger.info(
-            "run_done | info=%s stop=%s sumsq=%s res_var=%s",
-            getattr(out, "info", None),
-            getattr(out, "stopreason", None),
-            getattr(out, "sum_square", None),
-            getattr(out, "res_var", None),
-        )
-    return out
+    return odr.run()
 
 
 def calc_fit_statistics(final: Output) -> Dict[str, Any]:
@@ -459,37 +415,52 @@ def calc_fit_statistics(final: Output) -> Dict[str, Any]:
     ----------
     final : scipy.odr.Output
         Optimization results object.
-    ndof : int
-        Number of degrees of freedom.
-    fit : dict
-        Dictoinary to store fit data. Default is defaultdict(dict).
 
     Returns
     -------
-    fit : dict
-        Updated dictionary.
+    dict
+        Fit results dictionary.
     """
-    chi2 = final.sum_square  # type: ignore
-    chi2_red = getattr(final, "res_var", np.nan)  # type: ignore
-    if chi2_red and chi2_red != 0:
-        ndof = chi2 / chi2_red  # type: ignore
-    else:
-        ndof = float("nan")
+    # Unpack parameters and their standard deviations
+    p_values = getattr(final, "beta", np.nan)
+    p_stddevs = getattr(final, "sd_beta", np.nan)
+
+    # Unpack residuals
+    eps = getattr(final, "eps", np.nan)
+
+    # Calculate number of degrees of freedom
+    p_free = int(np.count_nonzero(np.asarray(p_stddevs) > 0))  # no. of free params
+    n_used = int(np.size(eps))  # no. of response residuals with nonzero weight
+    ndof = n_used - p_free if n_used > p_free else np.nan
+
+    # ODR tries to minimize both the residual values (sum_square_eps) and the distance
+    # data points would need to be shifted (delta_Gi, delta_Gii) to fall exactly onto
+    # the curve (sum_square_delta). They are summed up as sum_square. For implicit fits,
+    # delta can become very large, i.e., sum_square_delta >> sum_square_eps, which
+    # means estimating the number of degrees of freedom from the total sum of squares
+    # is fragile. Therefore, we use the sum of squares of the residuals (sum_square_eps)
+    # to get reduced chi squared and to compute the number of degrees of freedom.
+    chi2 = getattr(final, "sum_square", np.nan)
+    chi2_red = chi2 / ndof if (np.isfinite(ndof) and ndof > 0) else np.nan
+
+    # Optimiation objective
+    S_total = getattr(final, "sum_square", np.nan)
 
     # Guard p-value and R^2 to avoid division by zero / invalid dof
     if np.isfinite(ndof) and ndof > 0:
         p_val = distributions.chi2.sf(chi2, ndof)
         R2 = 1 - chi2 / (ndof + chi2)
     else:
-        p_val = 1.0 if chi2 == 0 else float("nan")
-        R2 = 1.0 if chi2 == 0 else 0.0
+        p_val = np.nan
+        R2 = np.nan
 
     return {
-        "params": final.beta,
-        "stddev": final.sd_beta,
+        "params": p_values,
+        "stddev": p_stddevs,
         "reduced_chi_squared": chi2_red,
         "chi_squared": chi2,
         "ndof": ndof,
+        "S_total": S_total,
         "p_value": p_val,
         "R_squared": R2,
         "final": final,
@@ -521,40 +492,80 @@ def results(fit: Dict[str, Any]) -> None:
     chi2 = fit["reduced_chi_squared"]
     pval = fit["p_value"]
     R2 = fit["R_squared"]
+    ndof = fit["ndof"]
+    S_total = fit["S_total"]
 
-    # Define the header and horizontal rules
-    header = "Variable   Value   Description".upper()
-    rule = "---".join(["-" * s for s in [8, 5, 50]])
+    # Handling np.nan gracefully
+    def fmt(val, fmtstr="7.3f"):
+        return f"{val:{fmtstr}}" if np.isfinite(val) else "nan"
 
-    # Print the header
-    print(header)
-    print(rule)
+    def rule(width: int = 50):
+        return "-" * width
 
-    # Print fit paramters
-    print(f"GIc_1      {GIc_1:5.3f}   Mode I fracture toughness")
-    print(f"GIIc_1     {GIIc_1:5.3f}   Mode II fracture toughness")
-    print(f"GIc_2      {GIc_2:5.3f}   Mode I fracture toughness")
-    print(f"GIIc_2     {GIIc_2:5.3f}   Mode II fracture toughness")
-    print(f"GIc_3      {GIc_3:5.3f}   Mode I fracture toughness")
-    print(f"GIIc_3     {GIIc_3:5.3f}   Mode II fracture toughness")
-    print(f"n          {n:5.2f}   Interaction-law exponent")
-    print(f"m          {m:5.2f}   Interaction-law exponent")
-    print(rule)
+    # Print fit parameters in compact table format
+    print(f"{'GIc':<5}   {'GIIc':<5}   DESCRIPTION")
+    print(rule(45))
+    print(f"{GIc_1:5.3f}   {GIIc_1:5.3f}   Series 1 fracture toughnesses")
+    print(f"{GIc_2:5.3f}   {GIIc_2:5.3f}   Series 2 fracture toughnesses")
+    print(f"{GIc_3:5.3f}   {GIIc_3:5.3f}   Series 3 fracture toughnesses")
+    print()
 
-    # Print goodness-of-fit indicators
-    print(f"chi2       {chi2:5.3f}   Reduced chi^2 per DOF (goodness of fit)")
-    print(f"p-value    {pval:5.3f}   p-value (statistically significant if below 0.05)")
-    print(f"R2         {R2:5.3f}   R-squared (not valid for nonlinear regression)")
+    print("EXPONENTS   DESCRIPTION")
+    print(rule(45))
+    print(f"n  {n:6.3f}   Mode I interaction-law exponent")
+    print(f"m  {m:6.3f}   Mode II interaction-law exponent")
+    print()
+
+    print("STATISTICS")
+    print(rule(70))
+    print(f"chi^2_red  {fmt(chi2)}   Residual sum of squares per DOF (goodness of fit)")
+    print(f"p-value    {fmt(pval)}   p-value (significant if below 0.05)")
+    print(f"R^2        {fmt(R2)}   R-squared (not valid for nonlinear regression)")
+    print(f"nDOF       {ndof:7.0f}   n(DOF) as n(used obs) - n(free params)")
+    print(f"S_total    {S_total:7.0f}   Total sum of squares (optimization objective)")
     print()
 
 
-def odr(
-    df,
-    source,
-    print_results=True,
-    log_level: int | None = None,
-    log_file: str | None = None,
+def assemble_initial_guesses(
+    series_names,
+    gc_list: list[float] = [0.1],
+    nm_list: list[float] | list[tuple[float, float]] = np.linspace(0.1, 1.0, 10),
+    tie_nm: bool = False,
 ):
+    """
+    Assemble initial guess arrays for regression.
+
+    Parameters
+    ----------
+    series_names : list
+        List of series names (for number of GIc/GIIc).
+    gc_list : list of float
+        List of values to use for both GIc and GIIc (always tied).
+    nm_list : list of tuple or list of float
+        List of (n, m) tuples if tie_nm is False, or list of n values if tie_nm is True.
+    tie_nm : bool
+        If True, use n=m for all guesses; if False, use (n, m) pairs from nm_list.
+
+    Returns
+    -------
+    guesses : list
+        List of initial guess arrays.
+    """
+    guesses = []
+    for gc in gc_list:
+        gIc0 = np.full(len(series_names), gc)
+        gIIc0 = np.full(len(series_names), gc)
+        if tie_nm:
+            for n in nm_list:
+                guesses.append(np.concatenate([gIc0, gIIc0, [n, n]]))
+        else:
+            for n in nm_list:
+                for m in nm_list:
+                    guesses.append(np.concatenate([gIc0, gIIc0, [n, m]]))
+    return guesses
+
+
+def odr(df, source, print_results=True):
     """
     Perform orthogonal distance regression (ODR) on the data frame.
 
@@ -574,30 +585,6 @@ def odr(
     print_results : bool
         If True, print fit results to console. Default is True.
     """
-    # Optionally set logger level for this call
-    prev_level = None
-    prev_propagate = None
-    file_handler: logging.Handler | None = None
-    if log_level is not None:
-        prev_level = logger.level
-        logger.setLevel(log_level)
-    if log_file is not None:
-        try:
-            file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-            effective_level = (
-                log_level if log_level is not None else logger.getEffectiveLevel()
-            )
-            file_handler.setLevel(effective_level)
-            file_handler.setFormatter(
-                logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-            )
-            logger.addHandler(file_handler)
-            # Ensure logs don't propagate to root handlers (e.g., Jupyter console)
-            prev_propagate = logger.propagate
-            logger.propagate = False
-        except Exception:  # fallback silently if file handler creation fails
-            file_handler = None
-
     # Assemble ODR pack data object
     data, series_names, series_idx = assemble_data(df, source)
 
@@ -610,92 +597,119 @@ def odr(
         extra_args=(series_idx,),
     )
 
-    # Get the dataframe for the given source
-    source_df = df.xs(source, level="source")
-
-    # Get initial guesses for the fracture toughnesses
-    gIc0 = [
-        np.nanmedian(unp.nominal_values(source_df.loc[s, "GIc"])) for s in series_names
-    ]
-    gIIc0 = [
-        np.nanmedian(unp.nominal_values(source_df.loc[s, "GIIc"])) for s in series_names
-    ]
-
-    # Create a grid of n and m values strictly within (0, 1], avoiding 0
-    # to prevent division by zero or undefined exponents.
-    nm_values = np.linspace(0.1, 1, 10)
-    guess = [
-        [val for pair in zip(gIc0, gIIc0) for val in pair] + [n, m]
-        for n in nm_values
-        for m in nm_values
-    ]
-    logger.info(
-        "odr | source=%s | series=%s | n_grid=%d | guesses=%d | gIc0=%s | gIIc0=%s",
-        source,
-        ",".join(map(str, series_names)),
-        len(nm_values),
-        len(guess),
-        np.array2string(np.asarray(gIc0), precision=3),
-        np.array2string(np.asarray(gIIc0), precision=3),
+    # Assemble initial guesses
+    guess = assemble_initial_guesses(
+        series_names,
+        gc_list=[0.3],
+        nm_list=np.linspace(0.05, 1, 20),
+        tie_nm=False,
     )
-    # guess = [
-    #     [val for pair in zip([0.11, 0.11, 0.11], [0.22, 0.22, 0.22]) for val in pair]
-    #     + [n, n]
-    #     for n in nm_values
-    # ]
 
-    # Run regression for all guesses. Prefer successful runs (info <= 3),
-    # but fall back to the best run overall if none converge.
-    runs_all = []
-    for g in guess:
-        try:
-            runs_all.append(run_regression(data, model, g))
-        except Exception:
-            # Skip runs that error out completely
-            continue
-    if not runs_all:
-        raise ValueError(
-            "ODR failed to start for all initializations. Check input data for NaNs/Inf or invalid structure."
-        )
-    runs_ok = [r for r in runs_all if getattr(r, "info", 9) <= 3]
-    logger.info("runs_ok=%d total_runs=%d", len(runs_ok), len(runs_all))
-    if len(runs_ok) > 0:
-        candidates = runs_ok
-        # Determine run with smallest sum of squared errors among candidates
-        final = min(candidates, key=lambda r: getattr(r, "sum_square", np.inf))  # type: ignore
+    # Run regressions with all start values
+    fixed_params = [1, 1, 1, 1, 1, 1, 0, 0]
+    all_runs = [run_regression(data, model, g, ifixb=fixed_params) for g in guess]
 
-        # Compile fit results dictionary with goodness-of-fit info
-        fit = calc_fit_statistics(final)
-
-        # Print fit results to console
-        if print_results:
-            results(fit)
+    # Check results
+    fit_results = [calc_fit_statistics(r) for r in all_runs if r.info <= 3]
+    if len(fit_results) == 0:
+        print("No runs converged")
+        return None
     else:
-        candidates = runs_all
-        # Log info attribute for runs that failed to converge
-        for r in runs_all[:5]:
-            logger.warning(
-                "nonconverged | info=%s stop=%s",
-                getattr(r, "info", None),
-                getattr(r, "stopreason", None),
-            )
-        # Determine run with smallest sum of squared errors among candidates
-        final = min(candidates, key=lambda r: getattr(r, "sum_square", np.inf))  # type: ignore
+        filtered_results = [r for r in fit_results if r["reduced_chi_squared"] > 0]
+        best_result = min(filtered_results, key=lambda r: r["S_total"])
 
-        # Compile fit results dictionary with goodness-of-fit info
-        fit = calc_fit_statistics(final)
+        if print_results:
+            results(best_result)
 
-    # Restore previous logger level if modified
-    if prev_level is not None:
-        logger.setLevel(prev_level)
-    if file_handler is not None:
-        try:
-            if prev_propagate is not None:
-                logger.propagate = prev_propagate
-            logger.removeHandler(file_handler)
-            file_handler.close()
-        except Exception:
-            pass
+    return best_result
 
-    # Return fit results dictionary
-    return fit
+
+@dataclass
+class _FinalLite:
+    beta: np.ndarray
+    sd_beta: np.ndarray
+    sum_square: float
+    res_var: float
+    info: int
+    niter: int
+    stopreason: str
+
+
+def _run_single_guess_process(args):
+    """Worker: build model/data in-process and run ODR for a single guess."""
+    Gi, Gii, Gi_err, Gii_err, series_idx, beta0, fixed_params = args
+    try:
+        x = np.vstack([Gi, Gii])
+        sx = np.vstack([Gi_err, Gii_err])
+        data = RealData(x, y=1, sx=sx)
+        model = Model(
+            fcn=residual,
+            fjacb=param_jacobian,
+            fjacd=value_jacobian,
+            implicit=True,
+            extra_args=(series_idx,),
+        )
+        odr = ODR(
+            data,
+            model,
+            beta0=beta0,
+            sstol=1e-12,
+            partol=1e-12,
+            maxit=1000,
+            ndigit=12,
+            ifixb=fixed_params,
+        )
+        odr.set_job(fit_type=1, deriv=3)
+        return odr.run()
+
+    except Exception:
+        return None
+
+
+def parallel_odr(df, source, print_results=True, max_workers: int = 12):
+    """
+    Parallel version of odr(): runs all initial guesses concurrently using processes.
+    """
+    # Prepare arrays for pickling to workers
+    source_df = df.xs(source, level="source")
+    Gi = unp.nominal_values(source_df["GIc"].to_numpy())
+    Gii = unp.nominal_values(source_df["GIIc"].to_numpy())
+    Gi_err = unp.std_devs(source_df["GIc"].to_numpy())
+    Gii_err = unp.std_devs(source_df["GIIc"].to_numpy())
+    series_names = sorted(source_df.index.get_level_values("series").unique())
+    series2idx = {s: i for i, s in enumerate(series_names)}
+    series_idx = source_df.index.get_level_values("series").map(series2idx).to_numpy()
+
+    # Set gc_list to span from min(min(Gi), min(Gii)) to max(max(Gi), max(Gii)), ensuring min > 0
+    gc_min = max(min(np.min(Gi), np.min(Gii)), 1e-6)
+    gc_max = max(np.max(Gi), np.max(Gii))
+    gc_list = np.linspace(gc_min, gc_max, 5)
+
+    # Initial guesses
+    guess = assemble_initial_guesses(
+        series_names,
+        gc_list=gc_list,
+        # nm_list=np.linspace(0.02, 1, 50),
+        nm_list=np.linspace(0.02, 1, 100),
+        tie_nm=False,
+    )
+    fixed_params = [1, 1, 1, 1, 1, 1, 0, 0]
+    tasks = [(Gi, Gii, Gi_err, Gii_err, series_idx, g, fixed_params) for g in guess]
+
+    # Run in parallel
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        all_runs = list(ex.map(_run_single_guess_process, tasks))
+
+    # Check results
+    fit_results = [calc_fit_statistics(r) for r in all_runs if r.info <= 3]
+    if len(fit_results) == 0:
+        print("No runs converged")
+        return None
+    else:
+        filtered_results = [r for r in fit_results if r["reduced_chi_squared"] > 0]
+        best_result = min(filtered_results, key=lambda r: r["S_total"])
+
+        if print_results:
+            results(best_result)
+
+    return best_result

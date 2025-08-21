@@ -100,12 +100,16 @@ def build_fracture_toughness_df(
 
 
 def filter_by_gc_threshold(
-    df: pd.DataFrame, *, source: str, gc_max: float
+    df: pd.DataFrame,
+    *,
+    source: str,
+    gic_max: float | None = None,
+    giic_max: float | None = None,
 ) -> pd.DataFrame:
     """
     Filter rows for a given `source` (e.g., "manual" or "video") so that
-    the nominal values of both GIc and GIIc are <= gc_max. Other sources are
-    left unchanged.
+    the nominal values of GIc and GIIc are <= their respective thresholds.
+    Other sources are left unchanged.
 
     Parameters
     ----------
@@ -113,8 +117,10 @@ def filter_by_gc_threshold(
         MultiIndex (source, series) dataframe with columns GIc, GIIc as ufloats.
     source : str
         Which source level to filter (e.g., "manual" or "video").
-    gc_max : float
-        Threshold applied to nominal values of GIc and GIIc.
+    gic_max : float, optional
+        Threshold applied to nominal values of GIc. If None, no filtering on GIc.
+    giic_max : float, optional
+        Threshold applied to nominal values of GIIc. If None, no filtering on GIIc.
 
     Returns
     -------
@@ -133,7 +139,14 @@ def filter_by_gc_threshold(
         sub = df.loc[sel]
         gic_vals = unp.nominal_values(sub["GIc"].to_numpy())
         giic_vals = unp.nominal_values(sub["GIIc"].to_numpy())
-        keep_sel = (gic_vals <= gc_max) & (giic_vals <= gc_max)
+
+        # Apply filters separately
+        keep_sel = pd.Series(True, index=sub.index)
+        if gic_max is not None:
+            keep_sel &= gic_vals <= gic_max
+        if giic_max is not None:
+            keep_sel &= giic_vals <= giic_max
+
         keep.loc[sel] = keep_sel
 
     return df.loc[keep]
